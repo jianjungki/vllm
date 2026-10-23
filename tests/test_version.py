@@ -13,7 +13,10 @@ def test_version_is_defined():
 
 
 def test_version_tuple():
-    assert len(version.__version_tuple__) in (3, 4, 5)
+    # (major, minor, patch) plus optional pre-release tag, dev-distance, and
+    # git-hash components - setuptools_scm can emit any combination of them,
+    # e.g. 6 when a dev build sits on top of an rc-tagged commit.
+    assert len(version.__version_tuple__) >= 3
 
 
 @pytest.mark.parametrize(
@@ -31,7 +34,8 @@ def test_version_tuple():
         ((1, 0, 0), "1.-1", True),
         ((1, 0, 0), "0.9", False),
         ((1, 0, 0), "0.17", False),
-    ])
+    ],
+)
 def test_prev_minor_version_was(version_tuple, version_str, expected):
     with patch("vllm.version.__version_tuple__", version_tuple):
         assert version._prev_minor_version_was(version_str) == expected

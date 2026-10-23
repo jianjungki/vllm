@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
-from collections.abc import Iterable
-from typing import Any, Callable, Optional
+from collections.abc import Callable, Iterable
+from typing import Any
 
 import torch
 import torch.utils.benchmark as TBenchmark
@@ -17,8 +17,7 @@ class CudaGraphBenchParams:
 
 @dataclasses.dataclass
 class ArgPool:
-    """
-    When some argument of the benchmarking function is annotated with this type,
+    """When some argument of the benchmarking function is annotated with this type,
     the benchmarking class (BenchMM) will collapse the argument to a pick a
     single value from the given list of values, during function invocation.
     For every invocation during a benchmarking run, it will choose a
@@ -55,7 +54,7 @@ class Bench:
 
     def __init__(
         self,
-        cuda_graph_params: Optional[CudaGraphBenchParams],
+        cuda_graph_params: CudaGraphBenchParams | None,
         label: str,
         sub_label: str,
         description: str,

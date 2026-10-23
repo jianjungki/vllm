@@ -14,13 +14,11 @@ struct KernelVecType<float> {
   using cvt_vec_type = vec_op::FP32Vec16;
 };
 
-#if !defined(__aarch64__) || defined(ARM_BF16_SUPPORT)
 template <>
 struct KernelVecType<c10::BFloat16> {
   using load_vec_type = vec_op::BF16Vec16;
   using cvt_vec_type = vec_op::FP32Vec16;
 };
-#endif
 
 template <>
 struct KernelVecType<c10::Half> {
@@ -145,7 +143,8 @@ void dynamic_scaled_int8_quant_impl(const scalar_t* input, int8_t* output,
       }
     }
 
-    float scale_val, azp_val;
+    float scale_val;
+    float azp_val = 0.0f;
     if constexpr (AZP) {
       float max_scalar = max_value.reduce_max();
       float min_scalar = min_value.reduce_min();
@@ -203,7 +202,7 @@ void dynamic_quant_epilogue(const float* input, scalar_t* output,
   using cvt_vec_t = typename KernelVecType<scalar_t>::cvt_vec_type;
   constexpr int vec_elem_num = load_vec_t::VEC_ELEM_NUM;
 
-  const int64_t thread_num = omp_get_max_threads();
+  const int64_t thread_num = cpu_utils::get_max_threads();
   if (num_tokens > thread_num) {
 #pragma omp parallel for
     for (int64_t i = 0; i < num_tokens; ++i) {
@@ -216,7 +215,7 @@ void dynamic_quant_epilogue(const float* input, scalar_t* output,
         float zp_scale_val = a_scale[i] * static_cast<float>(azp[i]);
         token_zp_scale_vec = cvt_vec_t(zp_scale_val);
       }
-      for (; j < hidden_size - vec_elem_num; ++j) {
+      for (; j < hidden_size - vec_elem_num; j += vec_elem_num) {
         cvt_vec_t elems_fp32(input_ptr + j);
         elems_fp32 = elems_fp32 * token_scale_vec;
         if constexpr (AZP) {
@@ -359,13 +358,14 @@ void onednn_scaled_mm(
     const std::optional<torch::Tensor>& azp,      // [M] or [1]
     const std::optional<torch::Tensor>& azp_adj,  // [M] or [1]
     const std::optional<torch::Tensor>& bias,     // [N]
-    int64_t handler) {
+    const torch::Tensor& handler_tensor) {
   CPU_KERNEL_GUARD_IN(onednn_scaled_mm)
   TORCH_CHECK(a.dim() == 2);
   TORCH_CHECK(a.is_contiguous());
   TORCH_CHECK(c.is_contiguous());
   W8A8MatMulPrimitiveHandler* ptr =
-      reinterpret_cast<W8A8MatMulPrimitiveHandler*>(handler);
+      reinterpret_cast<W8A8MatMulPrimitiveHandler*>(
+          handler_tensor.item<int64_t>());
   const int32_t* azp_ptr = nullptr;
   if (azp.has_value()) {
     azp_ptr = azp->data_ptr<int32_t>();
@@ -513,36 +513,82 @@ int64_t create_onednn_mm_handler(const torch::Tensor& b,
                                  args.ab_type = get_dnnl_type<scalar_t>();
                                });
 
+#ifdef VLLM_USE_ACL
+  // TODO(fadara01): this is a hot-fix, remove once problem is addressed in the
+  // AArch64 stack. hybrid kernels in ACL which are the fastest for LM head
+  // layers are only enabled for BF16 x BF16 -> FP32 problem desc as they can't
+  // convert FP32->BF16 internally. In this case do: oneDNN matmul with
+  // bf16:bf16:fp32 then cast output down to bf16.
+  if (b.scalar_type() == at::kBFloat16 && b.size(1) >= 64000) {
+    args.c_type = dnnl::memory::data_type::f32;
+  }
+#endif
+
   return reinterpret_cast<int64_t>(new MatMulPrimitiveHandler(args));
 }
 
 void onednn_mm(torch::Tensor& c,        // [M, OC], row-major
                const torch::Tensor& a,  // [M, IC], row-major
-               const std::optional<torch::Tensor>& bias, int64_t handler) {
+               const std::optional<torch::Tensor>& bias,
+               const torch::Tensor& handler_tensor) {
   CPU_KERNEL_GUARD_IN(onednn_mm)
   TORCH_CHECK(a.dim() == 2);
   TORCH_CHECK(a.stride(-1) == 1);
-  TORCH_CHECK(c.is_contiguous());
+  TORCH_CHECK(c.stride(-1) == 1);
   MatMulPrimitiveHandler* ptr =
-      reinterpret_cast<MatMulPrimitiveHandler*>(handler);
+      reinterpret_cast<MatMulPrimitiveHandler*>(handler_tensor.item<int64_t>());
+
+  torch::Tensor dnnl_output = c;
+  // AArch64 specific case where we do a bf16 x bf16 -> fp32 matmul
+  const bool convert_output =
+      ptr->get_output_type() == dnnl::memory::data_type::f32 &&
+      c.scalar_type() != at::kFloat;
+  if (convert_output) {
+    dnnl_output = torch::empty(c.sizes(), c.options().dtype(at::kFloat));
+  }
+
+// ACL matmuls expect contiguous source tensors
+#ifdef VLLM_USE_ACL
+  torch::Tensor a_contig = a.contiguous();
+#endif
 
   MatMulPrimitiveHandler::ExecArgs exec_args;
+  exec_args.c_ptr = dnnl_output.data_ptr();
+
+#ifdef VLLM_USE_ACL
+  exec_args.a_m_size = a_contig.size(0);
+  exec_args.a_m_stride = a_contig.stride(0);
+#else
   exec_args.a_m_size = a.size(0);
   exec_args.a_m_stride = a.stride(0);
-
+#endif
   VLLM_DISPATCH_FLOATING_TYPES(a.scalar_type(), "onednn_mm", [&] {
     if (bias.has_value()) {
       exec_args.use_bias = true;
       exec_args.bias_type = get_dnnl_type<scalar_t>();
+#ifdef VLLM_USE_ACL
+      // ACL matmuls in oneDNN do not support a bias.
+      // We handle a matmul with bias by doing: c = bias; c += matmul(a, b)
+      dnnl_output.copy_(bias.value());
+#else
       exec_args.bias_ptr = bias->data_ptr<scalar_t>();
+#endif
     } else {
       exec_args.use_bias = false;
       exec_args.bias_type = get_dnnl_type<void>();
       exec_args.bias_ptr = nullptr;
     }
+#ifdef VLLM_USE_ACL
+    exec_args.a_ptr = a_contig.data_ptr<scalar_t>();
+#else
     exec_args.a_ptr = a.data_ptr<scalar_t>();
-    exec_args.c_ptr = c.data_ptr<scalar_t>();
+
+#endif
 
     ptr->execute(exec_args);
   });
+
+  if (convert_output) {
+    c.copy_(dnnl_output);
+  }
 }

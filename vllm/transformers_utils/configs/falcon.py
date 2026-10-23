@@ -18,11 +18,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Falcon configuration"""
-from transformers.configuration_utils import PretrainedConfig
+"""Falcon configuration."""
+
+from transformers.configuration_utils import PreTrainedConfig
 
 
-class RWConfig(PretrainedConfig):
+class RWConfig(PreTrainedConfig):
     model_type = "falcon"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {
@@ -77,9 +78,7 @@ class RWConfig(PretrainedConfig):
             # Hack for falcon-40b
             self.new_decoder_architecture = True
 
-        super().__init__(bos_token_id=bos_token_id,
-                         eos_token_id=eos_token_id,
-                         **kwargs)
+        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
     @property
     def head_dim(self):
