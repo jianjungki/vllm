@@ -241,6 +241,7 @@ def test_leading_system_before_assistant_gets_assistant_header():
             {"role": "assistant", "content": "answer"},
         ],
         thinking=False,
+        add_generation_prompt=False,
     ) == (
         "<｜begin▁of▁sentence｜><｜System｜>rules<｜Assistant｜></think>"
         "answer<｜end▁of▁sentence｜>"
